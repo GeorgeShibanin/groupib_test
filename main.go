@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,7 +15,7 @@ type PutResponseData struct {
 }
 
 type Query struct {
-	mutex sync.Mutex
+	mutex sync.RWMutex
 	query chan string
 }
 
@@ -27,7 +26,7 @@ type Broker struct {
 }
 
 type SelfQueue struct {
-	mutex sync.Mutex
+	mutex sync.RWMutex
 	left  []string
 	right []string
 }
@@ -37,11 +36,12 @@ type HTTPHandler struct {
 }
 
 func (q *SelfQueue) Append(s string) {
+	q.mutex.Lock()
 	q.left = append(q.left, s)
+	q.mutex.Unlock()
 }
 
 func (q *SelfQueue) Return() string {
-	log.Println("len left", len(q.left), " len rignt ", len(q.right))
 	if len(q.left) == 0 && len(q.right) == 0 {
 		return ""
 	}
@@ -54,7 +54,6 @@ func (q *SelfQueue) Return() string {
 	defer q.mutex.Unlock()
 	for i := len(q.left) - 1; i >= 0; i-- {
 		q.right = append(q.right, q.left[i])
-		log.Println("apeend this to right", q.left[i])
 	}
 	q.left = make([]string, 0)
 	return q.Return()
@@ -81,15 +80,14 @@ func (q *Query) GetChannel() chan string {
 
 func (b *Broker) initReader(q *Query) {
 	fmt.Println("initReader: ", q)
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
+	q.mutex.RLock()
+	defer q.mutex.RUnlock()
 	log.Println("start For in initReader")
 	for {
 		select {
 		case s := <-q.GetChannel():
 			fmt.Println("value out: ", s)
 		}
-
 	}
 }
 
@@ -99,6 +97,7 @@ func (b *Broker) ApplyQuery(q string, wait time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
 	query, ok := b.queries[q]
+	//queue, ok2 := b.selfQueue[q]
 	if !ok || query == nil {
 		fmt.Println("query initialization:", q)
 		query = InitQuery()
@@ -109,6 +108,12 @@ func (b *Broker) ApplyQuery(q string, wait time.Duration) (string, error) {
 	}
 	var val string
 	for {
+		if b.selfQueue[q] == nil {
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("wrong query name")
+			}
+			continue
+		}
 		val = b.selfQueue[q].Return()
 		if val != "" || ctx.Err() != nil {
 			query.Add(val)
@@ -121,18 +126,17 @@ func (b *Broker) ApplyQuery(q string, wait time.Duration) (string, error) {
 
 func (b *Broker) ApplySelfQueue(v string, q string) {
 	log.Println(v, q)
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.mutex.RLock()
 	queue, ok := b.selfQueue[q]
+	b.mutex.RUnlock()
 	if !ok || queue == nil {
 		fmt.Println("self query initialization:", q)
+		b.mutex.Lock()
 		queue = InitSelfQueue()
 		b.selfQueue[q] = queue
+		b.mutex.Unlock()
 	}
-
 	b.selfQueue[q].Append(v)
-	log.Println("add this to SelfQueue", v)
-
 	return
 }
 
@@ -148,25 +152,9 @@ func (h *HTTPHandler) HandlePutQueue(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	h.broker.ApplySelfQueue(value, queryName[1])
-
-	response := PutResponseData{
-		Response: "OK",
-	}
-	rawResponse, err := json.Marshal(response)
-	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	rw.Header().Set("Content-Type", "application/json")
-	_, err = rw.Write(rawResponse)
-	if err != nil {
-		http.Error(rw, err.Error(), http.StatusBadRequest)
-		return
-	}
 }
 
 func (h *HTTPHandler) HandleGetQueue(rw http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(rw, "HandleGetQueue")
 	queryName := strings.Split(r.URL.Path, "/")
 	timeout := r.URL.Query().Get("timeout")
 	if timeout == "" {
@@ -175,23 +163,13 @@ func (h *HTTPHandler) HandleGetQueue(rw http.ResponseWriter, r *http.Request) {
 	seconds, _ := time.ParseDuration(timeout + "s")
 
 	resultFromQuery, err := h.broker.ApplyQuery(queryName[1], seconds)
-	if err != nil {
+	if resultFromQuery == "" || err != nil {
 		rw.WriteHeader(404)
 		return
 	}
-
-	response := PutResponseData{
-		Response: resultFromQuery,
-	}
-	rawResponse, err := json.Marshal(response)
+	_, err = rw.Write([]byte(resultFromQuery))
 	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	rw.Header().Set("Content-Type", "application/json")
-	_, err = rw.Write(rawResponse)
-	if err != nil {
-		http.Error(rw, err.Error(), http.StatusBadRequest)
+		rw.WriteHeader(404)
 		return
 	}
 }
@@ -203,7 +181,6 @@ func (h *HTTPHandler) HandleQueue(rw http.ResponseWriter, r *http.Request) {
 	if r.Method == "PUT" {
 		h.HandlePutQueue(rw, r)
 	}
-	http.Error(rw, "unexpected method", http.StatusNotFound)
 }
 
 func main() {
