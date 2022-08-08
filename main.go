@@ -156,8 +156,9 @@ func main() {
 		},
 	}
 	http.HandleFunc("/", handler.HandleQueue)
-
-	err := http.ListenAndServe("localhost:8080", nil)
+	//port := os.Getenv("SERVER_PORT")
+	port := "8080"
+	err := http.ListenAndServe("localhost:"+port, nil)
 	if err != nil {
 		return
 	}
