@@ -10,18 +10,8 @@ import (
 	"time"
 )
 
-type PutResponseData struct {
-	Response string `json:""`
-}
-
-type Query struct {
-	mutex sync.RWMutex
-	query chan string
-}
-
 type Broker struct {
 	mutex     sync.RWMutex
-	queries   map[string]*Query
 	selfQueue map[string]*SelfQueue
 }
 
@@ -59,35 +49,10 @@ func (q *SelfQueue) Return() string {
 	return q.Return()
 }
 
-func InitQuery() *Query {
-	return &Query{query: make(chan string)}
-}
-
 func InitSelfQueue() *SelfQueue {
 	return &SelfQueue{
 		left:  make([]string, 0),
 		right: make([]string, 0),
-	}
-}
-
-func (q *Query) Add(v string) {
-	q.query <- v
-}
-
-func (q *Query) GetChannel() chan string {
-	return q.query
-}
-
-func (b *Broker) initReader(q *Query) {
-	fmt.Println("initReader: ", q)
-	q.mutex.RLock()
-	defer q.mutex.RUnlock()
-	log.Println("start For in initReader")
-	for {
-		select {
-		case s := <-q.GetChannel():
-			fmt.Println("value out: ", s)
-		}
 	}
 }
 
@@ -96,16 +61,6 @@ func (b *Broker) ApplyQuery(q string, wait time.Duration) (string, error) {
 	defer b.mutex.RUnlock()
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
-	query, ok := b.queries[q]
-	//queue, ok2 := b.selfQueue[q]
-	if !ok || query == nil {
-		fmt.Println("query initialization:", q)
-		query = InitQuery()
-		b.queries[q] = query
-	}
-	if !ok {
-		go b.initReader(query)
-	}
 	var val string
 	for {
 		if b.selfQueue[q] == nil {
@@ -116,7 +71,6 @@ func (b *Broker) ApplyQuery(q string, wait time.Duration) (string, error) {
 		}
 		val = b.selfQueue[q].Return()
 		if val != "" || ctx.Err() != nil {
-			query.Add(val)
 			break
 		}
 	}
@@ -146,8 +100,8 @@ func (h *HTTPHandler) HandlePutQueue(rw http.ResponseWriter, r *http.Request) {
 	queryName := strings.Split(r.URL.Path, "/")
 	value := r.URL.Query().Get("v")
 
-	if len(queryName) == 0 && value == "" {
-		http.Error(rw, "invalid query params", http.StatusBadRequest)
+	if len(queryName) < 2 || value == "" {
+		http.Error(rw, "", http.StatusBadRequest)
 		return
 	}
 
@@ -160,7 +114,16 @@ func (h *HTTPHandler) HandleGetQueue(rw http.ResponseWriter, r *http.Request) {
 	if timeout == "" {
 		timeout = "0"
 	}
-	seconds, _ := time.ParseDuration(timeout + "s")
+	seconds, err := time.ParseDuration(timeout + "s")
+	if err != nil {
+		http.Error(rw, "", http.StatusBadRequest)
+		return
+	}
+
+	if len(queryName) < 2 {
+		http.Error(rw, "", http.StatusBadRequest)
+		return
+	}
 
 	resultFromQuery, err := h.broker.ApplyQuery(queryName[1], seconds)
 	if resultFromQuery == "" || err != nil {
@@ -177,16 +140,18 @@ func (h *HTTPHandler) HandleGetQueue(rw http.ResponseWriter, r *http.Request) {
 func (h *HTTPHandler) HandleQueue(rw http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		h.HandleGetQueue(rw, r)
+		return
 	}
 	if r.Method == "PUT" {
 		h.HandlePutQueue(rw, r)
+		return
 	}
+	http.Error(rw, "", http.StatusNotFound)
 }
 
 func main() {
 	handler := HTTPHandler{
 		broker: &Broker{
-			queries:   make(map[string]*Query),
 			selfQueue: make(map[string]*SelfQueue),
 		},
 	}
